@@ -8,7 +8,7 @@ class CustomDomainValidation:
         self.dkim_domain = dkim_domain
         self._dkim_records = {
             (f"{key}._domainkey", f"{key}._domainkey.{self.dkim_domain}")
-            for key in ("dkim", "dkim02", "dkim03")
+            for key in ("dkim",)
         }
 
     def get_dkim_records(self) -> {str: str}:
