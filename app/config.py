@@ -120,7 +120,7 @@ if POSTFIX_SUBMISSION_TLS:
 else:
     default_postfix_port = 25
 POSTFIX_PORT = int(os.environ.get("POSTFIX_PORT", default_postfix_port))
-POSTFIX_TIMEOUT = os.environ.get("POSTFIX_TIMEOUT", 3)
+POSTFIX_TIMEOUT = int(os.environ.get("POSTFIX_TIMEOUT", 3))
 
 # ["domain1.com", "domain2.com"]
 OTHER_ALIAS_DOMAINS = sl_getenv("OTHER_ALIAS_DOMAINS", list)
@@ -281,6 +281,7 @@ JOB_DELETE_MAILBOX = "delete-mailbox"
 JOB_DELETE_DOMAIN = "delete-domain"
 JOB_SEND_USER_REPORT = "send-user-report"
 JOB_SEND_PROTON_WELCOME_1 = "proton-welcome-1"
+JOB_SEND_ALIAS_CREATION_EVENTS = "send-alias-creation-events"
 
 # for pagination
 PAGE_LIMIT = 20

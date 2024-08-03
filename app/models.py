@@ -263,6 +263,15 @@ class UnsubscribeBehaviourEnum(EnumE):
     PreserveOriginal = 2
 
 
+class AliasDeleteReason(EnumE):
+    Unspecified = 0
+    UserHasBeenDeleted = 1
+    ManualAction = 2
+    DirectoryDeleted = 3
+    MailboxDeleted = 4
+    CustomDomainDeleted = 5
+
+
 class IntEnumType(sa.types.TypeDecorator):
     impl = sa.Integer
 
@@ -330,6 +339,7 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
     FLAG_FREE_DISABLE_CREATE_ALIAS = 1 << 0
     FLAG_CREATED_FROM_PARTNER = 1 << 1
     FLAG_FREE_OLD_ALIAS_LIMIT = 1 << 2
+    FLAG_CREATED_ALIAS_FROM_PARTNER = 1 << 3
 
     email = sa.Column(sa.String(256), unique=True, nullable=False)
 
@@ -666,6 +676,12 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         user: User = cls.get(obj_id)
         EventDispatcher.send_event(user, EventContent(user_deleted=UserDeleted()))
 
+        # Manually delete all aliases for the user that is about to be deleted
+        from app.alias_utils import delete_alias
+
+        for alias in Alias.filter_by(user_id=user.id):
+            delete_alias(alias, user, AliasDeleteReason.UserHasBeenDeleted)
+
         res = super(User, cls).delete(obj_id)
         if commit:
             Session.commit()
@@ -969,8 +985,8 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         - the domain
         """
         res = []
-        for domain in self.available_sl_domains(alias_options=alias_options):
-            res.append((True, domain))
+        for domain in self.get_sl_domains(alias_options=alias_options):
+            res.append((True, domain.domain))
 
         for custom_domain in self.verified_custom_domains():
             res.append((False, custom_domain.domain))
@@ -1112,7 +1128,10 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         - Verified custom domains
 
         """
-        domains = self.available_sl_domains(alias_options=alias_options)
+        domains = [
+            sl_domain.domain
+            for sl_domain in self.get_sl_domains(alias_options=alias_options)
+        ]
 
         for custom_domain in self.verified_custom_domains():
             domains.append(custom_domain.domain)
@@ -1152,6 +1171,13 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         if self.flags & User.FLAG_FREE_DISABLE_CREATE_ALIAS == 0:
             return True
         return not config.DISABLE_CREATE_CONTACTS_FOR_FREE_USERS
+
+    def has_used_alias_from_partner(self) -> bool:
+        return (
+            self.flags
+            & (User.FLAG_CREATED_ALIAS_FROM_PARTNER | User.FLAG_CREATED_FROM_PARTNER)
+            > 0
+        )
 
     def __repr__(self):
         return f"<User {self.id} {self.name} {self.email}>"
@@ -1645,6 +1671,12 @@ class Alias(Base, ModelMixin):
             enabled=True,
         )
         EventDispatcher.send_event(user, EventContent(alias_created=event))
+
+        if (
+            new_alias.flags & cls.FLAG_PARTNER_CREATED > 0
+            and new_alias.user.flags & User.FLAG_CREATED_ALIAS_FROM_PARTNER == 0
+        ):
+            user.flags = user.flags | User.FLAG_CREATED_ALIAS_FROM_PARTNER
 
         if commit:
             Session.commit()
@@ -2247,6 +2279,12 @@ class DeletedAlias(Base, ModelMixin):
     __tablename__ = "deleted_alias"
 
     email = sa.Column(sa.String(256), unique=True, nullable=False)
+    reason = sa.Column(
+        IntEnumType(AliasDeleteReason),
+        nullable=False,
+        default=AliasDeleteReason.Unspecified,
+        server_default=str(AliasDeleteReason.Unspecified.value),
+    )
 
     @classmethod
     def create(cls, **kw):
@@ -2434,6 +2472,13 @@ class CustomDomain(Base, ModelMixin):
         if obj.is_sl_subdomain:
             DeletedSubdomain.create(domain=obj.domain)
 
+        from app import alias_utils
+
+        for alias in Alias.filter_by(custom_domain_id=obj_id):
+            alias_utils.delete_alias(
+                alias, obj.user, AliasDeleteReason.CustomDomainDeleted
+            )
+
         return super(CustomDomain, cls).delete(obj_id)
 
     @property
@@ -2441,7 +2486,7 @@ class CustomDomain(Base, ModelMixin):
         return sorted(self._auto_create_rules, key=lambda rule: rule.order)
 
     def __repr__(self):
-        return f"<Custom Domain {self.domain}>"
+        return f"<Custom Domain {self.id} {self.domain}>"
 
 
 class AutoCreateRule(Base, ModelMixin):
@@ -2506,6 +2551,12 @@ class DomainDeletedAlias(Base, ModelMixin):
 
     domain = orm.relationship(CustomDomain)
     user = orm.relationship(User, foreign_keys=[user_id])
+    reason = sa.Column(
+        IntEnumType(AliasDeleteReason),
+        nullable=False,
+        default=AliasDeleteReason.Unspecified,
+        server_default=str(AliasDeleteReason.Unspecified.value),
+    )
 
     @classmethod
     def create(cls, **kw):
@@ -2597,7 +2648,7 @@ class Directory(Base, ModelMixin):
         for alias in Alias.filter_by(directory_id=obj_id):
             from app import alias_utils
 
-            alias_utils.delete_alias(alias, user)
+            alias_utils.delete_alias(alias, user, AliasDeleteReason.DirectoryDeleted)
 
         DeletedDirectory.create(name=obj.name)
         cls.filter(cls.id == obj_id).delete()
@@ -2725,7 +2776,7 @@ class Mailbox(Base, ModelMixin):
                 from app import alias_utils
 
                 # only put aliases that have mailbox as a single mailbox into trash
-                alias_utils.delete_alias(alias, user)
+                alias_utils.delete_alias(alias, user, AliasDeleteReason.MailboxDeleted)
             Session.commit()
 
         cls.filter(cls.id == obj_id).delete()
@@ -2751,6 +2802,16 @@ class Mailbox(Base, ModelMixin):
 
     def __repr__(self):
         return f"<Mailbox {self.id} {self.email}>"
+
+
+class MailboxActivation(Base, ModelMixin):
+    __tablename__ = "mailbox_activation"
+
+    mailbox_id = sa.Column(
+        sa.ForeignKey(Mailbox.id, ondelete="cascade"), nullable=False, index=True
+    )
+    code = sa.Column(sa.String(32), nullable=False, index=True)
+    tries = sa.Column(sa.Integer, default=0, nullable=False)
 
 
 class AccountActivation(Base, ModelMixin):
@@ -2971,11 +3032,7 @@ class RecoveryCode(Base, ModelMixin):
     @classmethod
     def find_by_user_code(cls, user: User, code: str):
         hashed_code = cls._hash_code(code)
-        # TODO: Only return hashed codes once there aren't unhashed codes in the db.
-        found_code = cls.get_by(user_id=user.id, code=hashed_code)
-        if found_code:
-            return found_code
-        return cls.get_by(user_id=user.id, code=code)
+        return cls.get_by(user_id=user.id, code=hashed_code)
 
     @classmethod
     def empty(cls, user):
@@ -3070,7 +3127,7 @@ class SLDomain(Base, ModelMixin):
     )
 
     def __repr__(self):
-        return f"<SLDomain {self.domain} {'Premium' if self.premium_only else 'Free'}"
+        return f"<SLDomain {self.id} {self.domain} {'Premium' if self.premium_only else 'Free'}>"
 
 
 class Monitoring(Base, ModelMixin):
@@ -3440,6 +3497,7 @@ class AdminAuditLog(Base):
             action=AuditLogActionEnum.stop_trial.value,
             model="User",
             model_id=user_id,
+            data={},
         )
 
     @classmethod
@@ -3685,6 +3743,7 @@ class SyncEvent(Base, ModelMixin):
     taken_time = sa.Column(
         ArrowType, default=None, nullable=True, server_default=None, index=True
     )
+    retry_count = sa.Column(sa.Integer, default=0, nullable=False, server_default="0")
 
     __table_args__ = (
         sa.Index("ix_sync_event_created_at", "created_at"),
@@ -3706,7 +3765,7 @@ class SyncEvent(Base, ModelMixin):
         return res.rowcount > 0
 
     @classmethod
-    def get_dead_letter(cls, older_than: Arrow) -> [SyncEvent]:
+    def get_dead_letter(cls, older_than: Arrow, max_retries: int) -> [SyncEvent]:
         return (
             SyncEvent.filter(
                 (
@@ -3719,6 +3778,7 @@ class SyncEvent(Base, ModelMixin):
                         & (SyncEvent.created_at < older_than)
                     )
                 )
+                & (SyncEvent.retry_count < max_retries)
             )
             .order_by(SyncEvent.id)
             .limit(100)

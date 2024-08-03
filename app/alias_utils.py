@@ -26,10 +26,15 @@ from app.email_utils import (
 )
 from app.errors import AliasInTrashError
 from app.events.event_dispatcher import EventDispatcher
-from app.events.generated.event_pb2 import AliasDeleted, AliasStatusChange, EventContent
+from app.events.generated.event_pb2 import (
+    AliasDeleted,
+    AliasStatusChanged,
+    EventContent,
+)
 from app.log import LOG
 from app.models import (
     Alias,
+    AliasDeleteReason,
     CustomDomain,
     Directory,
     User,
@@ -305,7 +310,9 @@ def try_auto_create_via_domain(address: str) -> Optional[Alias]:
         return None
 
 
-def delete_alias(alias: Alias, user: User):
+def delete_alias(
+    alias: Alias, user: User, reason: AliasDeleteReason = AliasDeleteReason.Unspecified
+):
     """
     Delete an alias and add it to either global or domain trash
     Should be used instead of Alias.delete, DomainDeletedAlias.create, DeletedAlias.create
@@ -320,6 +327,7 @@ def delete_alias(alias: Alias, user: User):
                 user_id=user.id,
                 email=alias.email,
                 domain_id=alias.custom_domain_id,
+                reason=reason,
             )
             Session.add(domain_deleted_alias)
             Session.commit()
@@ -328,7 +336,7 @@ def delete_alias(alias: Alias, user: User):
             )
     else:
         if not DeletedAlias.get_by(email=alias.email):
-            deleted_alias = DeletedAlias(email=alias.email)
+            deleted_alias = DeletedAlias(email=alias.email, reason=reason)
             Session.add(deleted_alias)
             Session.commit()
             LOG.i(f"Moving {alias} to global trash {deleted_alias}")
@@ -449,10 +457,12 @@ def transfer_alias(alias, new_user, new_mailboxes: [Mailbox]):
         f"Alias {alias.email} has been received",
         render(
             "transactional/alias-transferred.txt",
+            user=old_user,
             alias=alias,
         ),
         render(
             "transactional/alias-transferred.html",
+            user=old_user,
             alias=alias,
         ),
     )
@@ -468,9 +478,10 @@ def transfer_alias(alias, new_user, new_mailboxes: [Mailbox]):
 
 
 def change_alias_status(alias: Alias, enabled: bool, commit: bool = False):
+    LOG.i(f"Changing alias {alias} enabled to {enabled}")
     alias.enabled = enabled
 
-    event = AliasStatusChange(
+    event = AliasStatusChanged(
         alias_id=alias.id, alias_email=alias.email, enabled=enabled
     )
     EventDispatcher.send_event(alias.user, EventContent(alias_status_change=event))
