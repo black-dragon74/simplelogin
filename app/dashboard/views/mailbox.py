@@ -1,6 +1,7 @@
 import base64
 import binascii
 import json
+from typing import Optional
 
 from flask import render_template, request, redirect, url_for, flash
 from flask_login import login_required, current_user
@@ -15,6 +16,7 @@ from app.dashboard.base import dashboard_bp
 from app.db import Session
 from app.log import LOG
 from app.models import Mailbox
+from app.user_audit_log_utils import emit_user_audit_log, UserAuditLogAction
 from app.utils import CSRFValidationForm
 
 
@@ -50,6 +52,12 @@ def mailbox_route():
             if not delete_mailbox_form.validate():
                 flash("Invalid request", "warning")
                 return redirect(request.url)
+            mailbox = Mailbox.get(delete_mailbox_form.mailbox_id.data)
+            if mailbox and mailbox.is_admin_disabled():
+                flash(
+                    "You cannot modify that mailbox. Please contact support.", "error"
+                )
+                return redirect(url_for("dashboard.mailbox_route"))
             try:
                 mailbox = mailbox_utils.delete_mailbox(
                     current_user,
@@ -70,8 +78,14 @@ def mailbox_route():
             if not csrf_form.validate():
                 flash("Invalid request", "warning")
                 return redirect(request.url)
+            mailbox_id = request.form.get("mailbox_id")
+            mailbox = Mailbox.get(mailbox_id)
+            if mailbox and mailbox.is_admin_disabled():
+                flash(
+                    "You cannot modify that mailbox. Please contact support.", "error"
+                )
+                return redirect(url_for("dashboard.mailbox_route"))
             try:
-                mailbox_id = request.form.get("mailbox_id")
                 mailbox = user_settings.set_default_mailbox(current_user, mailbox_id)
             except user_settings.CannotSetMailbox as e:
                 flash(e.msg, "warning")
@@ -119,11 +133,22 @@ def mailbox_route():
 @login_required
 def mailbox_verify():
     mailbox_id = request.args.get("mailbox_id")
+    if not mailbox_id:
+        LOG.i("Missing mailbox_id")
+        flash("You followed an invalid link", "error")
+        return redirect(url_for("dashboard.mailbox_route"))
+
     code = request.args.get("code")
     if not code:
         # Old way
         return verify_with_signed_secret(mailbox_id)
-    mailbox = mailbox_utils.verify_mailbox_code(current_user, mailbox_id, code)
+
+    try:
+        mailbox = mailbox_utils.verify_mailbox_code(current_user, mailbox_id, code)
+    except mailbox_utils.MailboxError as e:
+        LOG.i(f"Cannot verify mailbox {mailbox_id} because of {e}")
+        flash(f"Cannot verify mailbox: {e.msg}", "error")
+        return redirect(url_for("dashboard.mailbox_route"))
     LOG.d("Mailbox %s is verified", mailbox)
     return render_template("dashboard/mailbox_validation.html", mailbox=mailbox)
 
@@ -146,7 +171,7 @@ def verify_with_signed_secret(request: str):
         flash("Invalid link. Please delete and re-add your mailbox", "error")
         return redirect(url_for("dashboard.mailbox_route"))
     mailbox_id = mailbox_data[0]
-    mailbox = Mailbox.get(mailbox_id)
+    mailbox: Optional[Mailbox] = Mailbox.get(mailbox_id)
     if not mailbox:
         flash("Invalid link", "error")
         return redirect(url_for("dashboard.mailbox_route"))
@@ -156,6 +181,11 @@ def verify_with_signed_secret(request: str):
         return redirect(url_for("dashboard.mailbox_route"))
 
     mailbox.verified = True
+    emit_user_audit_log(
+        user=current_user,
+        action=UserAuditLogAction.VerifyMailbox,
+        message=f"Verified mailbox {mailbox.id} ({mailbox.email})",
+    )
     Session.commit()
 
     LOG.d("Mailbox %s is verified", mailbox)

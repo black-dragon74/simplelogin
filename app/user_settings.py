@@ -1,8 +1,12 @@
+import uuid
 from typing import Optional
+
+from flask import session as flask_session
 
 from app.db import Session
 from app.log import LOG
 from app.models import User, SLDomain, CustomDomain, Mailbox
+from app.user_audit_log_utils import emit_user_audit_log, UserAuditLogAction
 
 
 class CannotSetAlias(Exception):
@@ -16,12 +20,13 @@ class CannotSetMailbox(Exception):
 
 
 def set_default_alias_domain(user: User, domain_name: Optional[str]):
-    if domain_name is None:
+    if not domain_name:
         LOG.i(f"User {user} has set no domain as default domain")
         user.default_alias_public_domain_id = None
         user.default_alias_custom_domain_id = None
         Session.flush()
         return
+
     sl_domain: SLDomain = SLDomain.get_by(domain=domain_name)
     if sl_domain:
         if sl_domain.hidden:
@@ -53,7 +58,7 @@ def set_default_alias_domain(user: User, domain_name: Optional[str]):
 
 
 def set_default_mailbox(user: User, mailbox_id: int) -> Mailbox:
-    mailbox = Mailbox.get(mailbox_id)
+    mailbox: Optional[Mailbox] = Mailbox.get(mailbox_id)
 
     if not mailbox or mailbox.user_id != user.id:
         raise CannotSetMailbox("Invalid mailbox")
@@ -66,5 +71,23 @@ def set_default_mailbox(user: User, mailbox_id: int) -> Mailbox:
     LOG.i(f"User {user} has set mailbox {mailbox} as his default one")
 
     user.default_mailbox_id = mailbox.id
+    emit_user_audit_log(
+        user=user,
+        action=UserAuditLogAction.UpdateMailbox,
+        message=f"Set mailbox {mailbox.id} ({mailbox.email}) as default",
+    )
+
     Session.commit()
     return mailbox
+
+
+def regenerate_user_alternative_id(user: User, update_session: bool = True):
+    """
+    Regenerate the user's alternative_id to log them out on other browsers/sessions.
+    Optionally updates the current flask session with the new alternative_id.
+    """
+    user.alternative_id = str(uuid.uuid4())
+    Session.flush()
+
+    if update_session:
+        flask_session["_user_id"] = user.alternative_id

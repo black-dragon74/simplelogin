@@ -2,6 +2,7 @@ import random
 from email.message import EmailMessage
 from typing import List
 
+import arrow
 import pytest
 from aiosmtpd.smtp import Envelope
 
@@ -14,7 +15,6 @@ from app.email_utils import generate_verp_email
 from app.mail_sender import mail_sender
 from app.models import (
     Alias,
-    AuthorizedAddress,
     IgnoredEmail,
     EmailLog,
     Notification,
@@ -24,36 +24,15 @@ from app.models import (
 )
 from app.utils import random_string, canonicalize_email
 from email_handler import (
-    get_mailbox_from_mail_from,
     should_ignore,
     is_automatic_out_of_office,
 )
 from tests.utils import load_eml_file, create_new_user, random_email
 
 
-def test_get_mailbox_from_mail_from(flask_client):
-    user = create_new_user()
-    alias = Alias.create_new_random(user)
-    Session.commit()
-
-    mb = get_mailbox_from_mail_from(user.email, alias)
-    assert mb.email == user.email
-
-    mb = get_mailbox_from_mail_from("unauthorized@gmail.com", alias)
-    assert mb is None
-
-    # authorized address
-    AuthorizedAddress.create(
-        user_id=user.id,
-        mailbox_id=user.default_mailbox_id,
-        email="unauthorized@gmail.com",
-        commit=True,
-    )
-    mb = get_mailbox_from_mail_from("unauthorized@gmail.com", alias)
-    assert mb.email == user.email
-
-
 def test_should_ignore(flask_client):
+    IgnoredEmail.filter_by(rcpt_to="rcpt_to").delete()
+
     assert should_ignore("mail_from", []) is False
 
     assert not should_ignore("mail_from", ["rcpt_to"])
@@ -237,7 +216,7 @@ def test_avoid_add_to_header_already_present_in_cc():
 def test_email_sent_to_noreply(flask_client):
     msg = EmailMessage()
     envelope = Envelope()
-    envelope.mail_from = "from@domain.test"
+    envelope.mail_from = "from@domain.lan"
     envelope.rcpt_tos = [config.NOREPLY]
     result = email_handler.handle(envelope, msg)
     assert result == status.E200
@@ -246,10 +225,10 @@ def test_email_sent_to_noreply(flask_client):
 def test_email_sent_to_noreplies(flask_client):
     msg = EmailMessage()
     envelope = Envelope()
-    envelope.mail_from = "from@domain.test"
-    config.NOREPLIES = ["other-no-reply@sl.test"]
+    envelope.mail_from = "from@domain.lan"
+    config.NOREPLIES = ["other-no-reply@sl.lan"]
 
-    envelope.rcpt_tos = ["other-no-reply@sl.test"]
+    envelope.rcpt_tos = ["other-no-reply@sl.lan"]
     result = email_handler.handle(envelope, msg)
     assert result == status.E200
 
@@ -411,3 +390,15 @@ def test_preserve_headers(flask_client):
     msg = sent_mails[0].msg
     for header in headers_to_keep:
         assert msg[header] == header + "keep"
+
+
+def test_not_send_to_pending_to_delete_users(flask_client):
+    user = create_new_user()
+    alias = Alias.create_new_random(user)
+    user.delete_on = arrow.utcnow()
+    envelope = Envelope()
+    envelope.mail_from = "somewhere@lo.cal"
+    envelope.rcpt_tos = [alias.email]
+    msg = EmailMessage()
+    result = email_handler.handle(envelope, msg)
+    assert result == status.E504

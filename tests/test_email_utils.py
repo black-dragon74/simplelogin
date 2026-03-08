@@ -9,11 +9,13 @@ import pytest
 from app import config
 from app.config import MAX_ALERT_24H, ROOT_DIR
 from app.db import Session
+from app.dns_utils import InMemoryDNSClient, set_global_dns_client
 from app.email import headers
 from app.email_utils import (
     get_email_domain_part,
     can_create_directory_for_address,
-    email_can_be_used_as_mailbox,
+    email_can_be_used_as_mailbox_with_reason,
+    EmailCannotBeUsedReason,
     delete_header,
     add_or_replace_header,
     send_email_with_rate_control,
@@ -51,6 +53,7 @@ from app.models import (
     AliasGeneratorEnum,
     SLDomain,
     Mailbox,
+    ForbiddenMxIp,
 )
 
 # flake8: noqa: E101, W191
@@ -63,13 +66,15 @@ from tests.utils import (
     random_token,
 )
 
-
-def setup_module(module):
-    config.SKIP_MX_LOOKUP_ON_CHECK = True
+dns_client = InMemoryDNSClient()
 
 
-def teardown_module(module):
-    config.SKIP_MX_LOOKUP_ON_CHECK = False
+def setup_module():
+    set_global_dns_client(dns_client)
+
+
+def teardown_module():
+    set_global_dns_client(None)
 
 
 def test_get_email_domain_part():
@@ -78,54 +83,113 @@ def test_get_email_domain_part():
 
 def test_email_belongs_to_alias_domains():
     # default alias domain
-    assert can_create_directory_for_address("ab@sl.local")
-    assert not can_create_directory_for_address("ab@not-exist.local")
+    assert can_create_directory_for_address("ab@sl.lan")
+    assert not can_create_directory_for_address("ab@not-exist.lan")
 
-    assert can_create_directory_for_address("hey@d1.test")
-    assert not can_create_directory_for_address("hey@d3.test")
+    assert can_create_directory_for_address("hey@d1.lan")
+    assert not can_create_directory_for_address("hey@d3.lan")
 
 
-def test_can_be_used_as_personal_email(flask_client):
+def test_cannot_be_used_as_personal_email(flask_client):
+    dns_client.set_mx_records("sl.lan", {10: ["mxdomain.com."]})
+    dns_client.set_mx_records("d1.lan", {10: ["mxdomain.com."]})
+    dns_client.set_mx_records("protonmail.com", {10: ["mxdomain.com."]})
+    dns_client.set_mx_records("gmail.com", {10: ["mxdomain.com."]})
     # default alias domain
-    assert not email_can_be_used_as_mailbox("ab@sl.local")
-    assert not email_can_be_used_as_mailbox("hey@d1.test")
+    assert (
+        EmailCannotBeUsedReason.IsSimpleLoginDomain
+        == email_can_be_used_as_mailbox_with_reason("ab@sl.lan")
+    )
+    assert (
+        EmailCannotBeUsedReason.IsSimpleLoginDomain
+        == email_can_be_used_as_mailbox_with_reason("hey@d1.lan")
+    )
 
-    # custom domain
+    # custom domain as SL domain
+    sl_domain = random_domain()
+    SLDomain.create(domain=sl_domain, flush=True)
+    assert (
+        EmailCannotBeUsedReason.IsSimpleLoginDomain
+        == email_can_be_used_as_mailbox_with_reason(f"hey@{sl_domain}")
+    )
+
+    # custom domain is NOT SL domain
     domain = random_domain()
+    dns_client.set_mx_records(domain, {10: ["mxdomain.com."]})
     user = create_new_user()
-    CustomDomain.create(user_id=user.id, domain=domain, verified=True, commit=True)
-    assert not email_can_be_used_as_mailbox(f"hey@{domain}")
+    CustomDomain.create(
+        user_id=user.id,
+        domain=domain,
+        verified=True,
+        is_sl_subdomain=True,
+        flush=True,
+    )
+    Session.flush()
+    assert (
+        EmailCannotBeUsedReason.IsCustomDomain
+        == email_can_be_used_as_mailbox_with_reason(f"hey@{domain}")
+    )
 
     # disposable domain
     disposable_domain = random_domain()
+    dns_client.set_mx_records(disposable_domain, {10: ["mxdomain.com."]})
     InvalidMailboxDomain.create(domain=disposable_domain, commit=True)
-    assert not email_can_be_used_as_mailbox(f"abcd@{disposable_domain}")
+    assert (
+        EmailCannotBeUsedReason.InvalidMailboxDomain
+        == email_can_be_used_as_mailbox_with_reason(f"abcd@{disposable_domain}")
+    )
     # subdomain will not work
-    assert not email_can_be_used_as_mailbox("abcd@sub.{disposable_domain}")
+    assert (
+        EmailCannotBeUsedReason.InvalidEmailAddress
+        == email_can_be_used_as_mailbox_with_reason("abcd@sub.{disposable_domain}")
+    )
     # valid domains should not be affected
-    assert email_can_be_used_as_mailbox("abcd@protonmail.com")
-    assert email_can_be_used_as_mailbox("abcd@gmail.com")
+    assert email_can_be_used_as_mailbox_with_reason("abcd@protonmail.com") is None
+    assert email_can_be_used_as_mailbox_with_reason("abcd@gmail.com") is None
 
 
 def test_disabled_user_prevents_email_from_being_used_as_mailbox():
-    email = f"user_{random_token(10)}@mailbox.test"
-    assert email_can_be_used_as_mailbox(email)
+    email = f"user_{random_token(10)}@mailbox.lan"
+    dns_client.set_mx_records("mailbox.lan", {10: ["mxdomain.com."]})
+    assert email_can_be_used_as_mailbox_with_reason(email) is None
     user = create_new_user(email)
     user.disabled = True
     Session.flush()
-    assert not email_can_be_used_as_mailbox(email)
+    assert (
+        EmailCannotBeUsedReason.EmailOfDisabledUser
+        == email_can_be_used_as_mailbox_with_reason(email)
+    )
 
 
 def test_disabled_user_with_secondary_mailbox_prevents_email_from_being_used_as_mailbox():
-    email = f"user_{random_token(10)}@mailbox.test"
-    assert email_can_be_used_as_mailbox(email)
+    email = f"user_{random_token(10)}@mailbox.lan"
+    dns_client.set_mx_records("mailbox.lan", {10: ["mxdomain.com."]})
+    assert email_can_be_used_as_mailbox_with_reason(email) is None
     user = create_new_user()
     Mailbox.create(user_id=user.id, email=email)
     Session.flush()
-    assert email_can_be_used_as_mailbox(email)
+    assert email_can_be_used_as_mailbox_with_reason(email) is None
     user.disabled = True
     Session.flush()
-    assert not email_can_be_used_as_mailbox(email)
+    assert (
+        EmailCannotBeUsedReason.MailboxOfDisabledUser
+        == email_can_be_used_as_mailbox_with_reason(email)
+    )
+
+
+def test_mx_invalid_ip():
+    ForbiddenMxIp.filter().delete()
+    invalid_mx_ip = "12.2.23.23"
+    valid_mx_ip = "1.1.1.1"
+    ForbiddenMxIp.create(ip=invalid_mx_ip, flush=True)
+    dns_client.set_mx_records("testdomain.com", {10: ["mxdomain.com."]})
+    dns_client.set_a_record("mxdomain.com", valid_mx_ip)
+    assert email_can_be_used_as_mailbox_with_reason("a@testdomain.com") is None
+    dns_client.set_a_record("mxdomain.com", invalid_mx_ip)
+    assert (
+        EmailCannotBeUsedReason.ForbiddenMxRecordFound
+        == email_can_be_used_as_mailbox_with_reason("a@testdomain.com")
+    )
 
 
 def test_delete_header():
@@ -585,8 +649,8 @@ def test_generate_reply_email_include_sender_in_reverse_alias(flask_client):
 
 
 def test_normalize_reply_email(flask_client):
-    assert normalize_reply_email("re+abcd@sl.local") == "re+abcd@sl.local"
-    assert normalize_reply_email('re+"ab cd"@sl.local') == "re+_ab_cd_@sl.local"
+    assert normalize_reply_email("re+abcd@sl.lan") == "re+abcd@sl.lan"
+    assert normalize_reply_email('re+"ab cd"@sl.lan') == "re+_ab_cd_@sl.lan"
 
 
 def test_get_encoding():
@@ -662,7 +726,7 @@ def test_should_disable(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
     for _ in range(20):
@@ -695,7 +759,7 @@ def test_should_disable_bounces_every_day(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
     for i in range(9):
@@ -723,7 +787,7 @@ def test_should_disable_bounces_account(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
 
@@ -751,7 +815,7 @@ def test_should_disable_bounce_consecutive_days(flask_client):
         user_id=user.id,
         alias_id=alias.id,
         website_email="contact@example.com",
-        reply_email="rep@sl.local",
+        reply_email="rep@sl.lan",
         commit=True,
     )
 
@@ -784,12 +848,21 @@ def test_parse_id_from_bounce():
     assert parse_id_from_bounce("anything+1234+@local") == 1234
 
 
-def test_get_queue_id():
+def test_get_queue_id_esmtps():
+    for id_type in ["SMTP", "ESMTP", "ESMTPA", "ESMTPS"]:
+        msg = email.message_from_string(
+            f"Received: from mail-wr1-x434.google.com (mail-wr1-x434.google.com [IPv6:2a00:1450:4864:20::434])\r\n\t(using TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 (128/128 bits))\r\n\t(No client certificate requested)\r\n\tby mx1.simplelogin.co (Postfix) with {id_type} id 4FxQmw1DXdz2vK2\r\n\tfor <jglfdjgld@alias.com>; Fri,  4 Jun 2021 14:55:43 +0000 (UTC)"
+        )
+
+        assert get_queue_id(msg) == "4FxQmw1DXdz2vK2", f"Failed for {id_type}"
+
+
+def test_get_queue_id_postfix():
     msg = email.message_from_string(
-        "Received: from mail-wr1-x434.google.com (mail-wr1-x434.google.com [IPv6:2a00:1450:4864:20::434])\r\n\t(using TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 (128/128 bits))\r\n\t(No client certificate requested)\r\n\tby mx1.simplelogin.co (Postfix) with ESMTPS id 4FxQmw1DXdz2vK2\r\n\tfor <jglfdjgld@alias.com>; Fri,  4 Jun 2021 14:55:43 +0000 (UTC)"
+        "Received: by mailin001.somewhere.net (Postfix)\r\n\tid 4Xz5pb2nMszGrqpL; Wed, 27 Nov 2024 17:21:59 +0000 (UTC)'] by mailin001.somewhere.net (Postfix)"
     )
 
-    assert get_queue_id(msg) == "4FxQmw1DXdz2vK2"
+    assert get_queue_id(msg) == "4Xz5pb2nMszGrqpL"
 
 
 def test_get_queue_id_from_double_header():

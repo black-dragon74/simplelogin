@@ -1,12 +1,10 @@
 import base64
-import binascii
 import enum
 import hmac
 import json
 import os
 import quopri
 import random
-import time
 import uuid
 from copy import deepcopy
 from email import policy, message_from_bytes, message_from_string
@@ -19,9 +17,12 @@ from smtplib import SMTP, SMTPException
 from typing import Tuple, List, Optional, Union
 
 import arrow
+import binascii
 import dkim
 import re2 as re
+import sentry_sdk
 import spf
+import time
 from aiosmtpd.smtp import Envelope
 from cachetools import cached, TTLCache
 from email_validator import (
@@ -31,13 +32,13 @@ from email_validator import (
 )
 from flanker.addresslib import address
 from flanker.addresslib.address import EmailAddress
+from flask_login import current_user
 from jinja2 import Environment, FileSystemLoader
 from sqlalchemy import func
-from flask_login import current_user
 
 from app import config
 from app.db import Session
-from app.dns_utils import get_mx_domains
+from app.dns_utils import get_mx_domains, get_a_record
 from app.email import headers
 from app.log import LOG
 from app.mail_sender import sl_sendmail
@@ -56,6 +57,7 @@ from app.models import (
     InvalidMailboxDomain,
     VerpType,
     available_sl_email,
+    ForbiddenMxIp,
 )
 from app.utils import (
     random_string,
@@ -89,7 +91,7 @@ def render(template_name: str, user: Optional[User], **kwargs) -> str:
         URL=config.URL,
         LANDING_PAGE_URL=config.LANDING_PAGE_URL,
         YEAR=arrow.now().year,
-        USE_PARTNER_TEMPLATE=use_partner_template,
+        SERVICE_PROVIDER="Proton" if use_partner_template else "SimpleLogin",
         **kwargs,
     )
 
@@ -123,6 +125,8 @@ def send_trial_end_soon_email(user):
 
 
 def send_activation_email(user: User, activation_link):
+    if not user.can_send_or_receive():
+        return
     send_email(
         user.email,
         "Just one more step to join SimpleLogin",
@@ -142,6 +146,8 @@ def send_activation_email(user: User, activation_link):
 
 
 def send_reset_password_email(user: User, reset_password_link):
+    if not user.can_send_or_receive():
+        return
     send_email(
         user.email,
         "Reset your password on SimpleLogin",
@@ -159,6 +165,8 @@ def send_reset_password_email(user: User, reset_password_link):
 
 
 def send_change_email(user: User, new_email, link):
+    if not user.can_send_or_receive():
+        return
     send_email(
         new_email,
         "Confirm email update on SimpleLogin",
@@ -179,7 +187,9 @@ def send_change_email(user: User, new_email, link):
     )
 
 
-def send_invalid_totp_login_email(user, totp_type):
+def send_invalid_totp_login_email(user: User, totp_type):
+    if not user.can_send_or_receive():
+        return
     send_email_with_rate_control(
         user,
         config.ALERT_INVALID_TOTP_LOGIN,
@@ -200,6 +210,8 @@ def send_invalid_totp_login_email(user, totp_type):
 
 
 def send_test_email_alias(user: User, email: str):
+    if not user.can_send_or_receive():
+        return
     send_email(
         email,
         f"This email is sent to {email}",
@@ -218,10 +230,12 @@ def send_test_email_alias(user: User, email: str):
     )
 
 
-def send_cannot_create_directory_alias(user, alias_address, directory_name):
+def send_cannot_create_directory_alias(user: User, alias_address, directory_name):
     """when user cancels their subscription, they cannot create alias on the fly.
     If this happens, send them an email to notify
     """
+    if not user.can_send_or_receive():
+        return
     send_email(
         user.email,
         f"Alias {alias_address} cannot be created",
@@ -240,10 +254,14 @@ def send_cannot_create_directory_alias(user, alias_address, directory_name):
     )
 
 
-def send_cannot_create_directory_alias_disabled(user, alias_address, directory_name):
+def send_cannot_create_directory_alias_disabled(
+    user: User, alias_address, directory_name
+):
     """when the directory is disabled, new alias can't be created on-the-fly.
     Send user an email to notify of an attempt
     """
+    if not user.can_send_or_receive():
+        return
     send_email_with_rate_control(
         user,
         config.ALERT_DIRECTORY_DISABLED_ALIAS_CREATION,
@@ -264,10 +282,12 @@ def send_cannot_create_directory_alias_disabled(user, alias_address, directory_n
     )
 
 
-def send_cannot_create_domain_alias(user, alias, domain):
+def send_cannot_create_domain_alias(user: User, alias, domain):
     """when user cancels their subscription, they cannot create alias on the fly with custom domain.
     If this happens, send them an email to notify
     """
+    if not user.can_send_or_receive():
+        return
     send_email(
         user.email,
         f"Alias {alias} cannot be created",
@@ -286,6 +306,7 @@ def send_cannot_create_domain_alias(user, alias, domain):
     )
 
 
+@sentry_sdk.trace
 def send_email(
     to_email,
     subject,
@@ -548,7 +569,9 @@ def can_create_directory_for_address(email_address: str) -> bool:
     for domain in config.ALIAS_DOMAINS:
         if email_address.endswith("@" + domain):
             return True
-
+    LOG.i(
+        f"Cannot create address in directory for {email_address} since it does not belong to a valid directory domain"
+    )
     return False
 
 
@@ -564,39 +587,51 @@ def is_valid_alias_address_domain(email_address) -> bool:
     return False
 
 
-def email_can_be_used_as_mailbox(email_address: str) -> bool:
-    """Return True if an email can be used as a personal email.
-    Use the email domain as criteria. A domain can be used if it is not:
-    - one of ALIAS_DOMAINS
-    - one of PREMIUM_ALIAS_DOMAINS
-    - one of custom domains
-    - a disposable domain
-    """
+class EmailCannotBeUsedReason(enum.Enum):
+    InvalidEmailAddress = "This email address is not valid"
+    InvalidEmailDomain = "This email domain is not valid"
+    IsSimpleLoginDomain = "This email is a SimpleLogin domain"
+    IsCustomDomain = (
+        "This email address belongs to a custom domain that has already been registered"
+    )
+    InvalidMailboxDomain = "We don't allow mailboxes using this domain"
+    NoMxRecordFound = "We couldn't get any MX records configured for this domain"
+    ForbiddenMxRecordFound = (
+        "We don't allow mailbox domains that point to these MX records"
+    )
+    EmailOfDisabledUser = "This email address is not allowed"
+    MailboxOfDisabledUser = "This email address is not allowed"
+
+
+def email_can_be_used_as_mailbox_with_reason(
+    email_address: str,
+) -> Optional[EmailCannotBeUsedReason]:
     try:
         domain = validate_email(
             email_address, check_deliverability=False, allow_smtputf8=False
         ).domain
     except EmailNotValidError:
         LOG.d("%s is invalid email address", email_address)
-        return False
+        return EmailCannotBeUsedReason.InvalidEmailAddress
 
     if not domain:
         LOG.d("no valid domain associated to %s", email_address)
-        return False
+        return EmailCannotBeUsedReason.InvalidEmailDomain
 
     if SLDomain.get_by(domain=domain):
         LOG.d("%s is a SL domain", email_address)
-        return False
+        return EmailCannotBeUsedReason.IsSimpleLoginDomain
 
     from app.models import CustomDomain
 
-    if CustomDomain.get_by(domain=domain, verified=True):
-        LOG.d("domain %s is a SimpleLogin custom domain", domain)
-        return False
+    custom_domain = CustomDomain.get_by(domain=domain, verified=True)
+    if custom_domain is not None:
+        LOG.d("domain %s is custom domain %s", domain, custom_domain)
+        return EmailCannotBeUsedReason.IsCustomDomain
 
     if is_invalid_mailbox_domain(domain):
         LOG.d("Domain %s is invalid mailbox domain", domain)
-        return False
+        return EmailCannotBeUsedReason.InvalidMailboxDomain
 
     # check if email MX domain is disposable
     mx_domains = get_mx_domain_list(domain)
@@ -604,19 +639,31 @@ def email_can_be_used_as_mailbox(email_address: str) -> bool:
     # if no MX record, email is not valid
     if not config.SKIP_MX_LOOKUP_ON_CHECK and not mx_domains:
         LOG.d("No MX record for domain %s", domain)
-        return False
+        return EmailCannotBeUsedReason.NoMxRecordFound
 
+    mx_ips = set()
     for mx_domain in mx_domains:
         if is_invalid_mailbox_domain(mx_domain):
             LOG.d("MX Domain %s %s is invalid mailbox domain", mx_domain, domain)
-            return False
+            return EmailCannotBeUsedReason.InvalidMailboxDomain
+        a_record = get_a_record(mx_domain)
+        LOG.i(
+            f"Found MX Domain {mx_domain} for mailbox {email_address} with a record {a_record}"
+        )
+        if a_record is not None:
+            mx_ips.add(a_record)
+    if len(mx_ips) > 0:
+        forbidden_ip = ForbiddenMxIp.filter(ForbiddenMxIp.ip.in_(list(mx_ips))).all()
+        if forbidden_ip:
+            LOG.i("Found forbidden MX ip %s", forbidden_ip)
+            return EmailCannotBeUsedReason.ForbiddenMxRecordFound
 
     existing_user = User.get_by(email=email_address)
     if existing_user and existing_user.disabled:
         LOG.d(
             f"User {existing_user} is disabled. {email_address} cannot be used for other mailbox"
         )
-        return False
+        return EmailCannotBeUsedReason.EmailOfDisabledUser
 
     for existing_user in (
         User.query()
@@ -627,11 +674,22 @@ def email_can_be_used_as_mailbox(email_address: str) -> bool:
     ):
         if existing_user.disabled:
             LOG.d(
-                f"User {existing_user} is disabled and has a mailbox with {email_address}. Id cannot be used for other mailbox"
+                f"User {existing_user} is disabled and has a mailbox with {email_address}. It cannot be used for other mailbox"
             )
-            return False
+            return EmailCannotBeUsedReason.MailboxOfDisabledUser
 
-    return True
+    return None
+
+
+def email_can_be_used_as_mailbox(email_address: str) -> bool:
+    """Return True if an email can be used as a personal email.
+    Use the email domain as criteria. A domain can be used if it is not:
+    - one of ALIAS_DOMAINS
+    - one of PREMIUM_ALIAS_DOMAINS
+    - one of custom domains
+    - a disposable domain
+    """
+    return email_can_be_used_as_mailbox_with_reason(email_address) is None
 
 
 def is_invalid_mailbox_domain(domain):
@@ -655,7 +713,11 @@ def get_mx_domain_list(domain) -> [str]:
     """
     priority_domains = get_mx_domains(domain)
 
-    return [d[:-1] for _, d in priority_domains]
+    mx_domains = []
+    for prio in priority_domains:
+        for domain in priority_domains[prio]:
+            mx_domains.append(domain[:-1])
+    return mx_domains
 
 
 def personal_email_already_used(email_address: str) -> bool:
@@ -1115,13 +1177,13 @@ def generate_reply_email(contact_email: str, alias: Alias) -> str:
         include_sender_in_reverse_alias = user.include_sender_in_reverse_alias
 
     if include_sender_in_reverse_alias and contact_email:
+        # use _ instead of . to avoid AC_FROM_MANY_DOTS SpamAssassin rule
+        contact_email = contact_email.replace("@", "_at_")
+        contact_email = contact_email.replace(".", "_")
         # make sure contact_email can be ascii-encoded
         contact_email = convert_to_id(contact_email)
         contact_email = sanitize_email(contact_email)
         contact_email = contact_email[:45]
-        # use _ instead of . to avoid AC_FROM_MANY_DOTS SpamAssassin rule
-        contact_email = contact_email.replace("@", "_at_")
-        contact_email = contact_email.replace(".", "_")
         contact_email = convert_to_alphanumeric(contact_email)
 
     reply_domain = config.EMAIL_DOMAIN
@@ -1185,11 +1247,11 @@ def should_disable(alias: Alias) -> (bool, str):
         .count()
     )
     # if more than 12 bounces in 24h -> disable alias
-    if nb_bounced_last_24h > 12:
-        return True, "+12 bounces in the last 24h"
+    if nb_bounced_last_24h > config.MAX_BOUNCES_1D:
+        return True, f"More than {config.MAX_BOUNCES_1D} bounces in the last 24h"
 
     # if more than 5 bounces but has +10 bounces last week -> disable alias
-    elif nb_bounced_last_24h > 5:
+    elif nb_bounced_last_24h > 1:
         one_week_ago = arrow.now().shift(days=-7)
         nb_bounced_7d_1d = (
             Session.query(EmailLog)
@@ -1202,10 +1264,10 @@ def should_disable(alias: Alias) -> (bool, str):
             .filter(EmailLog.alias_id == alias.id)
             .count()
         )
-        if nb_bounced_7d_1d > 10:
+        if nb_bounced_7d_1d > config.MAX_BOUNCES_1W:
             return (
                 True,
-                "+5 bounces in the last 24h and +10 bounces in the last 7 days",
+                f"More than {config.MAX_BOUNCES_1W} bounces in the last 7 days",
             )
     else:
         # alias level
@@ -1325,11 +1387,12 @@ def spf_pass(
 @cached(cache=TTLCache(maxsize=2, ttl=20))
 def get_smtp_server():
     LOG.d("get a smtp server")
+    server = random.choice(config.POSTFIX_SERVERS)
     if config.POSTFIX_SUBMISSION_TLS:
-        smtp = SMTP(config.POSTFIX_SERVER, 587)
+        smtp = SMTP(server, 587)
         smtp.starttls()
     else:
-        smtp = SMTP(config.POSTFIX_SERVER, config.POSTFIX_PORT)
+        smtp = SMTP(server, config.POSTFIX_PORT)
 
     return smtp
 
@@ -1343,17 +1406,18 @@ def get_queue_id(msg: Message) -> Optional[str]:
 
     received_header = str(msg[headers.RECEIVED])
     if not received_header:
-        return
+        return None
 
     # received_header looks like 'from mail-wr1-x434.google.com (mail-wr1-x434.google.com [IPv6:2a00:1450:4864:20::434])\r\n\t(using TLSv1.3 with cipher TLS_AES_128_GCM_SHA256 (128/128 bits))\r\n\t(No client certificate requested)\r\n\tby mx1.simplelogin.co (Postfix) with ESMTPS id 4FxQmw1DXdz2vK2\r\n\tfor <jglfdjgld@alias.com>; Fri,  4 Jun 2021 14:55:43 +0000 (UTC)'
-    search_result = re.search("with ESMTPS id [0-9a-zA-Z]{1,}", received_header)
-    if not search_result:
-        return
-
-    # the "with ESMTPS id 4FxQmw1DXdz2vK2" part
-    with_esmtps = received_header[search_result.start() : search_result.end()]
-
-    return with_esmtps[len("with ESMTPS id ") :]
+    search_result = re.search(r"with E?SMTP[AS]? id ([0-9a-zA-Z]{1,})", received_header)
+    if search_result:
+        return search_result.group(1)
+    search_result = re.search(
+        r"\(Postfix\)\r\n\tid ([a-zA-Z0-9]{1,});", received_header
+    )
+    if search_result:
+        return search_result.group(1)
+    return None
 
 
 def should_ignore_bounce(mail_from: str) -> bool:

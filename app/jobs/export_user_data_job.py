@@ -12,6 +12,7 @@ import arrow
 import sqlalchemy
 
 from app import config
+from app.constants import JobType
 from app.db import Session
 from app.email import headers
 from app.email_utils import (
@@ -129,6 +130,9 @@ class ExportUserDataJob:
         return memfile
 
     def run(self):
+        if not self._user.can_send_or_receive():
+            return
+
         zipped_contents = self._build_zip()
 
         to_email = self._user.email
@@ -174,7 +178,7 @@ class ExportUserDataJob:
         jobs_in_db = (
             Session.query(Job)
             .filter(
-                Job.name == config.JOB_SEND_USER_REPORT,
+                Job.name == JobType.SEND_USER_REPORT.value,
                 Job.payload.op("->")("user_id").cast(sqlalchemy.TEXT)
                 == str(self._user.id),
                 Job.taken.is_(False),
@@ -184,7 +188,7 @@ class ExportUserDataJob:
         if jobs_in_db > 0:
             return None
         return Job.create(
-            name=config.JOB_SEND_USER_REPORT,
+            name=JobType.SEND_USER_REPORT.value,
             payload={"user_id": self._user.id},
             run_at=arrow.now(),
             commit=True,

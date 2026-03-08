@@ -10,12 +10,13 @@ from app.config import PROTON_EXTRA_HEADER_NAME, PROTON_EXTRA_HEADER_VALUE
 from app.errors import ProtonAccountNotVerified
 from app.log import LOG
 
-_APP_VERSION = "OauthClient_1.0.0"
+_APP_VERSION = "Other_1.0.0"
 
 PROTON_ERROR_CODE_HV_NEEDED = 9001
 
 PLAN_FREE = 1
 PLAN_PREMIUM = 2
+PLAN_PREMIUM_LIFETIME = 3
 
 
 @dataclass
@@ -112,10 +113,13 @@ class HttpProtonClient(ProtonClient):
         if plan_value == PLAN_FREE:
             plan = SLPlan(type=SLPlanType.Free, expiration=None)
         elif plan_value == PLAN_PREMIUM:
+            expiration = info.get("PlanExpiration", "1")
             plan = SLPlan(
                 type=SLPlanType.Premium,
-                expiration=Arrow.fromtimestamp(info["PlanExpiration"], tzinfo="utc"),
+                expiration=Arrow.fromtimestamp(expiration, tzinfo="utc"),
             )
+        elif plan_value == PLAN_PREMIUM_LIFETIME:
+            plan = SLPlan(SLPlanType.PremiumLifetime, expiration=None)
         else:
             raise Exception(f"Invalid value for plan: {plan_value}")
 
@@ -136,8 +140,8 @@ class HttpProtonClient(ProtonClient):
         status = res.status_code
         as_json = res.json()
         if status != HTTPStatus.OK:
-            raise HttpProtonClient.__handle_response_not_ok(
-                status=status, body=as_json, text=res.text
+            raise Exception(
+                f"Unexpected status code. Wanted 200 and got {status}: " + res.text
             )
         res_code = as_json.get("Code")
         if not res_code or res_code != 1000:

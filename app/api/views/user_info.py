@@ -12,7 +12,7 @@ from app.dashboard.views.index import get_stats
 from app.db import Session
 from app.image_validation import detect_image_format, ImageFormat
 from app.models import ApiKey, File, PartnerUser, User
-from app.proton.utils import get_proton_partner
+from app.proton.proton_partner import get_proton_partner
 from app.session import logout_session
 from app.utils import random_string
 
@@ -87,7 +87,7 @@ def update_user_info():
                 File.delete(file.id)
                 s3.delete(file.path)
                 Session.flush()
-        else:
+        if data["profile_picture"] is not None:
             raw_data = base64.decodebytes(data["profile_picture"].encode())
             if detect_image_format(raw_data) == ImageFormat.Unknown:
                 return jsonify(error="Unsupported image format"), 400

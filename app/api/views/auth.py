@@ -1,7 +1,6 @@
 import secrets
 import string
 
-import facebook
 import google.oauth2.credentials
 import googleapiclient.discovery
 from flask import jsonify, request
@@ -9,6 +8,7 @@ from flask_login import login_user
 from itsdangerous import Signer
 
 from app import email_utils
+from app.abuser_utils import check_if_abuser_email
 from app.api.base import api_bp
 from app.config import FLASK_SECRET, DISABLE_REGISTRATION
 from app.dashboard.views.account_setting import send_reset_password_email
@@ -23,6 +23,7 @@ from app.events.auth_event import LoginEvent, RegisterEvent
 from app.extensions import limiter
 from app.log import LOG
 from app.models import User, ApiKey, SocialAuth, AccountActivation
+from app.user_audit_log_utils import emit_user_audit_log, UserAuditLogAction
 from app.utils import sanitize_email, canonicalize_email
 
 
@@ -52,8 +53,12 @@ def auth_login():
     password = data.get("password")
     device = data.get("device")
 
-    email = sanitize_email(data.get("email"))
-    canonical_email = canonicalize_email(data.get("email"))
+    email = data.get("email")
+    if not email:
+        LoginEvent(LoginEvent.ActionType.failed, LoginEvent.Source.api).send()
+        return jsonify(error="Email or password incorrect"), 400
+    email = sanitize_email(email)
+    canonical_email = canonicalize_email(email)
 
     user = User.get_by(email=email) or User.get_by(email=canonical_email)
 
@@ -108,6 +113,12 @@ def auth_register():
             RegisterEvent.ActionType.invalid_email, RegisterEvent.Source.api
         ).send()
         return jsonify(error=f"cannot use {email} as personal inbox"), 400
+
+    if check_if_abuser_email(email):
+        LOG.warn(
+            f"User with email {email} that was marked as abuser tried to register again"
+        )
+        return jsonify(error=f"cannot use {email} as it was previously banned"), 400
 
     if not password or len(password) < 8:
         RegisterEvent(RegisterEvent.ActionType.failed, RegisterEvent.Source.api).send()
@@ -183,6 +194,11 @@ def auth_activate():
 
     LOG.d("activate user %s", user)
     user.activated = True
+    emit_user_audit_log(
+        user=user,
+        action=UserAuditLogAction.ActivateUser,
+        message=f"User has been activated: {user.email}",
+    )
     AccountActivation.delete(account_activation.id)
     Session.commit()
 
@@ -212,6 +228,9 @@ def auth_reactivate():
     # do not use a different message to avoid exposing existing email
     if not user or user.activated:
         return jsonify(error="Something went wrong"), 400
+
+    if not user.can_send_or_receive():
+        return jsonify(error="User is disabled"), 400
 
     account_activation = AccountActivation.get_by(user_id=user.id)
     if account_activation:
@@ -251,6 +270,8 @@ def auth_facebook():
         }
 
     """
+    import facebook
+
     data = request.get_json()
     if not data:
         return jsonify(error="request body cannot be empty"), 400

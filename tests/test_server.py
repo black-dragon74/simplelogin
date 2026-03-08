@@ -1,8 +1,9 @@
 import arrow
 
+from app.config import EMAIL_DOMAIN
 from app.db import Session
 from app.models import CoinbaseSubscription
-from server import handle_coinbase_event
+from app.payments.coinbase import handle_coinbase_event
 from tests.utils import create_new_user
 
 
@@ -11,7 +12,7 @@ def test_redirect_login_page(flask_client):
 
     rv = flask_client.get("/")
     assert rv.status_code == 302
-    assert rv.location == "http://sl.test/auth/login"
+    assert rv.location == f"http://{EMAIL_DOMAIN}/auth/login"
 
 
 def test_coinbase_webhook(flask_client):

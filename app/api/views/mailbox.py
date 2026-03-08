@@ -6,12 +6,8 @@ from flask import request
 
 from app import mailbox_utils
 from app.api.base import api_bp, require_api_auth
-from app.dashboard.views.mailbox_detail import verify_mailbox_change
 from app.db import Session
-from app.email_utils import (
-    mailbox_already_used,
-    email_can_be_used_as_mailbox,
-)
+from app.extensions import limiter
 from app.models import Mailbox
 from app.utils import sanitize_email
 
@@ -28,6 +24,7 @@ def mailbox_to_dict(mailbox: Mailbox):
 
 
 @api_bp.route("/mailboxes", methods=["POST"])
+@limiter.limit("20/hour")
 @require_api_auth
 def create_mailbox():
     """
@@ -38,7 +35,11 @@ def create_mailbox():
         the new mailbox dict
     """
     user = g.user
-    mailbox_email = sanitize_email(request.get_json().get("email"))
+    email = request.get_json().get("email")
+    if not email:
+        return jsonify(error="Invalid email"), 400
+
+    mailbox_email = sanitize_email(email)
 
     try:
         new_mailbox = mailbox_utils.create_mailbox(user, mailbox_email).mailbox
@@ -52,6 +53,7 @@ def create_mailbox():
 
 
 @api_bp.route("/mailboxes/<int:mailbox_id>", methods=["DELETE"])
+@limiter.limit("100/hour")
 @require_api_auth
 def delete_mailbox(mailbox_id):
     """
@@ -66,6 +68,19 @@ def delete_mailbox(mailbox_id):
 
     """
     user = g.user
+    mailbox = Mailbox.get(mailbox_id)
+
+    if not mailbox or mailbox.user_id != user.id:
+        return jsonify(error="Forbidden"), 403
+
+    if mailbox.is_admin_disabled():
+        return (
+            jsonify(
+                error="This mailbox has been disabled and cannot be deleted. Please contact support."
+            ),
+            400,
+        )
+
     data = request.get_json() or {}
     transfer_mailbox_id = data.get("transfer_aliases_to")
     if transfer_mailbox_id and int(transfer_mailbox_id) >= 0:
@@ -83,6 +98,7 @@ def delete_mailbox(mailbox_id):
 
 @api_bp.route("/mailboxes/<int:mailbox_id>", methods=["PUT"])
 @require_api_auth
+@limiter.limit("100/hour")
 def update_mailbox(mailbox_id):
     """
     Update mailbox
@@ -101,6 +117,12 @@ def update_mailbox(mailbox_id):
     if not mailbox or mailbox.user_id != user.id:
         return jsonify(error="Forbidden"), 403
 
+    if mailbox.is_admin_disabled():
+        return (
+            jsonify(error="This mailbox has been disabled. Please contact support."),
+            400,
+        )
+
     data = request.get_json() or {}
     changed = False
     if "default" in data:
@@ -118,20 +140,10 @@ def update_mailbox(mailbox_id):
 
     if "email" in data:
         new_email = sanitize_email(data.get("email"))
-
-        if mailbox_already_used(new_email, user):
-            return jsonify(error=f"{new_email} already used"), 400
-        elif not email_can_be_used_as_mailbox(new_email):
-            return (
-                jsonify(
-                    error=f"{new_email} cannot be used. Please note a mailbox cannot "
-                    f"be a disposable email address"
-                ),
-                400,
-            )
-
         try:
-            verify_mailbox_change(user, mailbox, new_email)
+            mailbox_utils.request_mailbox_email_change(user, mailbox, new_email)
+        except mailbox_utils.MailboxError as e:
+            return jsonify(error=e.msg), 400
         except SMTPRecipientsRefused:
             return jsonify(error=f"Incorrect mailbox, please recheck {new_email}"), 400
         else:
@@ -141,7 +153,7 @@ def update_mailbox(mailbox_id):
     if "cancel_email_change" in data:
         cancel_email_change = data.get("cancel_email_change")
         if cancel_email_change:
-            mailbox.new_email = None
+            mailbox_utils.cancel_email_change(mailbox.id, user)
             changed = True
 
     if changed:
